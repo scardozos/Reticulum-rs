@@ -91,6 +91,9 @@ pub(crate) struct ResourceManager {
     pub started_callbacks: HashMap<LinkId, ResourceStartedCallback>,
     /// Registered request handlers per destination hash, keyed by path hash.
     pub request_handlers: HashMap<AddressHash, HashMap<AddressHash, RequestHandler>>,
+    /// (destination, path hash) pairs whose responses are never
+    /// auto-compressed (Python `register_request_handler(auto_compress=False)`).
+    pub uncompressed_responses: HashSet<(AddressHash, AddressHash)>,
     /// Pending outbound requests: request id -> link.
     pub pending_requests: HashMap<AddressHash, LinkId>,
     /// Responses that completed before the caller began awaiting them,
@@ -144,6 +147,7 @@ impl ResourceManager {
             accept_callbacks: HashMap::new(),
             started_callbacks: HashMap::new(),
             request_handlers: HashMap::new(),
+            uncompressed_responses: HashSet::new(),
             pending_requests: HashMap::new(),
             async_request_handlers: HashMap::new(),
             completed_responses: HashMap::new(),
@@ -201,6 +205,30 @@ impl ResourceManager {
         if let Some(handlers) = self.request_handlers.get_mut(&destination) {
             handlers.remove(&path_hash);
         }
+        self.uncompressed_responses
+            .remove(&(destination, path_hash));
+    }
+
+    /// Whether responses for `path` on `destination` may be auto-compressed.
+    pub fn set_response_compression(
+        &mut self,
+        destination: AddressHash,
+        path: &str,
+        enabled: bool,
+    ) {
+        let path_hash = crate::hash::Hash::new_from_slice(path.as_bytes());
+        let key = (destination, AddressHash::new_from_hash(&path_hash));
+        if enabled {
+            self.uncompressed_responses.remove(&key);
+        } else {
+            self.uncompressed_responses.insert(key);
+        }
+    }
+
+    pub fn compresses_responses(&self, destination: &AddressHash, path_hash: &AddressHash) -> bool {
+        !self
+            .uncompressed_responses
+            .contains(&(*destination, *path_hash))
     }
 
     /// Create, store and advertise an outgoing resource on `link`.
@@ -1129,6 +1157,31 @@ mod tests {
             SingleInputDestination::new(identity, DestinationName::new("test", "resource.request"))
                 .desc,
         )
+    }
+
+    #[test]
+    fn response_compression_is_per_destination_and_path() {
+        let mut manager = ResourceManager::new();
+        let dest = AddressHash::new_from_hash(&crate::hash::Hash::new_from_slice(b"dest"));
+        let other = AddressHash::new_from_hash(&crate::hash::Hash::new_from_slice(b"other"));
+        let path =
+            |p: &str| AddressHash::new_from_hash(&crate::hash::Hash::new_from_slice(p.as_bytes()));
+
+        // On by default, like Python's `auto_compress=True`.
+        assert!(manager.compresses_responses(&dest, &path("/data")));
+
+        manager.set_response_compression(dest, "/data", false);
+        assert!(!manager.compresses_responses(&dest, &path("/data")));
+        assert!(manager.compresses_responses(&dest, &path("/meta")));
+        assert!(manager.compresses_responses(&other, &path("/data")));
+
+        manager.set_response_compression(dest, "/data", true);
+        assert!(manager.compresses_responses(&dest, &path("/data")));
+
+        // Deregistering a handler forgets its setting.
+        manager.set_response_compression(dest, "/data", false);
+        manager.deregister_request_handler(dest, "/data");
+        assert!(manager.compresses_responses(&dest, &path("/data")));
     }
 
     #[test]

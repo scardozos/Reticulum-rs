@@ -9,6 +9,14 @@ use crate::hash::Hash;
 pub const PACKET_MDU: usize = 2048usize;
 pub const PACKET_IFAC_MAX_LENGTH: usize = 64usize;
 
+/// Largest link MTU this implementation can actually build packets for.
+/// Packets live in fixed `PACKET_MDU` buffers, so a link must never negotiate
+/// more than this (minus room for an interface access code), whatever MTU the
+/// interface or the peer would allow. Without this cap a link over a
+/// `LocalInterface` (HW MTU 256 KiB) negotiates 256 KiB and every packet
+/// between ~2 KiB and 256 KiB is silently dropped.
+pub const LINK_MTU_MAX: usize = PACKET_MDU - PACKET_IFAC_MAX_LENGTH;
+
 /// The MTU that Reticulum adheres to by default. Changing this breaks
 /// compatibility with all other RNS networks (see Python `RNS.Reticulum.MTU`).
 pub const PROTOCOL_MTU: usize = 500;

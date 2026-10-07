@@ -1331,6 +1331,25 @@ impl Transport {
             .register_request_handler(*destination, path, Arc::new(handler));
     }
 
+    /// Turn automatic bz2 compression of responses for `path` on or off
+    /// (Python `Destination.register_request_handler(..., auto_compress)`).
+    /// On by default. Turn it off for paths that return incompressible data
+    /// (media, archives, encrypted blobs): compressing it costs CPU and the
+    /// result is discarded anyway. Receivers handle both cases, since every
+    /// resource advertisement says whether its data is compressed.
+    pub async fn set_response_compression(
+        &self,
+        destination: &AddressHash,
+        path: &str,
+        enabled: bool,
+    ) {
+        self.handler
+            .lock()
+            .await
+            .resources
+            .set_response_compression(*destination, path, enabled);
+    }
+
     /// Register an async request handler for a path on one of our inbound
     /// destinations. Async handlers keep the transport responsive for
     /// long-running work (e.g. remote command execution).
@@ -2175,11 +2194,23 @@ impl TransportHandler {
         self.in_links.get(link_id).cloned()
     }
 
+    /// `out_links` is keyed by destination hash, not link id, so an outbound
+    /// link can only be found by id by looking at each link. `try_lock`, as
+    /// in `Transport::interface_stats_for_link`: the handler lock is held
+    /// here, and awaiting a link lock could deadlock against a task that
+    /// holds that link and waits for the handler.
+    fn find_out_link_by_id(&self, link_id: &LinkId) -> Option<Arc<Mutex<Link>>> {
+        self.out_links
+            .values()
+            .find(|link| link.try_lock().is_ok_and(|link| link.id() == link_id))
+            .cloned()
+    }
+
     pub(crate) async fn link_close(&self, link_id: LinkId) -> Result<(), RnsError> {
         let link = if let Some(link) = self.find_in_link(&link_id) {
             Some((link, &self.link_in_event_tx))
         } else {
-            self.find_out_link(&link_id)
+            self.find_out_link_by_id(&link_id)
                 .map(|link| (link, &self.link_out_event_tx))
         };
         if let Some((link, event_tx)) = link {
@@ -2747,6 +2778,7 @@ async fn send_response<'a>(
     link: &Link,
     rid: &AddressHash,
     response: &[u8],
+    auto_compress: bool,
     handler: &mut MutexGuard<'a, TransportHandler>,
 ) {
     let packed = pack_response(rid, response);
@@ -2758,6 +2790,7 @@ async fn send_response<'a>(
         let opts = ResourceOptions {
             request_id: Some(*rid),
             is_response: true,
+            auto_compress,
             ..Default::default()
         };
         match handler.resources.send_resource(link, packed, opts) {
@@ -2783,6 +2816,9 @@ async fn handle_incoming_request<'a>(
     let link = link_arc.lock().await;
     let destination = link.destination().address_hash;
     let remote_identity = link.remote_identity();
+    let auto_compress = handler
+        .resources
+        .compresses_responses(&destination, &path_hash);
 
     // Async handlers run WITHOUT the transport/link locks held: snapshot
     // the inputs, drop the link guard, run the future on the runtime, and
@@ -2819,7 +2855,7 @@ async fn handle_incoming_request<'a>(
             if let Some(response) = response {
                 let mut handler = transport_handler.lock().await;
                 let link = link_arc.lock().await;
-                send_response(&link, &rid, &response, &mut handler).await;
+                send_response(&link, &rid, &response, auto_compress, &mut handler).await;
             }
         });
         return;
@@ -2846,7 +2882,7 @@ async fn handle_incoming_request<'a>(
     });
 
     if let Some(response) = response {
-        send_response(&link, &rid, &response, handler).await;
+        send_response(&link, &rid, &response, auto_compress, handler).await;
     }
 }
 
