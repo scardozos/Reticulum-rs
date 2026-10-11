@@ -578,6 +578,7 @@ impl DecryptIdentity for PrivateIdentity {
 
 pub struct GroupIdentity {}
 
+#[derive(Clone)]
 pub struct DerivedKey {
     key: [u8; DERIVED_KEY_LENGTH],
 }

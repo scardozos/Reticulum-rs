@@ -1,8 +1,8 @@
 use crate::{
-    buffer::{InputBuffer, OutputBuffer, StaticBuffer},
+    buffer::{InputBuffer, OutputBuffer},
     error::RnsError,
     hash::AddressHash,
-    packet::{Header, HeaderType, PACKET_MDU, Packet, PacketContext},
+    packet::{Header, HeaderType, PACKET_MDU, Packet, PacketContext, PacketDataBuffer},
 };
 
 pub trait Serialize {
@@ -88,7 +88,7 @@ impl Packet {
             destination,
             transport,
             context,
-            data: StaticBuffer::new(),
+            data: PacketDataBuffer::new(),
         };
 
         // Hostile inputs may claim more payload than the protocol MTU
@@ -109,10 +109,11 @@ mod tests {
     use rand_core::OsRng;
 
     use crate::{
-        buffer::{InputBuffer, OutputBuffer, StaticBuffer},
+        buffer::{InputBuffer, OutputBuffer},
         hash::AddressHash,
         packet::{
-            DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext, PacketType,
+            DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext, PacketDataBuffer,
+            PacketType,
             PropagationType,
         },
     };
@@ -141,7 +142,7 @@ mod tests {
             destination: AddressHash::new_from_rand(OsRng),
             transport: None,
             context: PacketContext::None,
-            data: StaticBuffer::new(),
+            data: PacketDataBuffer::new(),
         };
 
         packet.serialize(&mut buffer).expect("serialized packet");
@@ -169,7 +170,7 @@ mod tests {
             destination: AddressHash::new_from_rand(OsRng),
             transport: None,
             context: PacketContext::None,
-            data: StaticBuffer::new(),
+            data: PacketDataBuffer::new(),
         };
 
         packet.data.safe_write(b"Hello, world!");

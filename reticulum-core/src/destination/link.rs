@@ -141,6 +141,9 @@ pub trait LinkPayloadSink: Clone + Send + Sync + 'static {
     fn send(&self, payload: LinkPayload);
 }
 
+/// `Clone` gives a snapshot: transport can build a large outgoing resource
+/// (encrypt + hash a megabyte) from a copy without holding the link's lock.
+#[derive(Clone)]
 pub struct Link {
     id: LinkId,
     destination: DestinationDesc,
@@ -787,7 +790,7 @@ impl Link {
 
         match packet.context {
             PacketContext::None => {
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = alloc::vec![0u8; PACKET_MDU];
                 if let Ok(plain_text) = self.decrypt_with_rng(
                     crate::crypt::fernet::ZeroRng,
                     packet.data.as_slice(),
@@ -812,7 +815,7 @@ impl Link {
                 }
             }
             PacketContext::LinkIdentify => {
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = alloc::vec![0u8; PACKET_MDU];
                 if let Ok(plain_text) = self.decrypt_with_rng(
                     crate::crypt::fernet::ZeroRng,
                     packet.data.as_slice(),
@@ -887,7 +890,7 @@ impl Link {
                 }
             }
             PacketContext::LinkRTT if !out_link => {
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = alloc::vec![0u8; PACKET_MDU];
                 if let Ok(plain_text) = self.decrypt_with_rng(
                     crate::crypt::fernet::ZeroRng,
                     packet.data.as_slice(),
@@ -910,7 +913,7 @@ impl Link {
                 }
             }
             PacketContext::LinkClose => {
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = alloc::vec![0u8; PACKET_MDU];
                 if let Ok(plain_text) = self.decrypt_with_rng(
                     crate::crypt::fernet::ZeroRng,
                     packet.data.as_slice(),
@@ -936,7 +939,7 @@ impl Link {
             }
             PacketContext::Channel => {
                 if let Some(channel_tx) = channel_tx {
-                    let mut buffer = [0u8; PACKET_MDU];
+                    let mut buffer = alloc::vec![0u8; PACKET_MDU];
                     if let Ok(plain_text) = self.decrypt_with_rng(
                         crate::crypt::fernet::ZeroRng,
                         packet.data.as_slice(),

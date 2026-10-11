@@ -54,13 +54,13 @@ pub enum TxMessageType {
     Direct(AddressHash),
 }
 
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct TxMessage {
     pub tx_type: TxMessageType,
     pub packet: Packet,
 }
 
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct RxMessage {
     pub address: AddressHash, // Address of source interface
     pub packet: Packet,       // Received packet
@@ -940,7 +940,7 @@ impl InterfaceManager {
                             control.sent_announce(now);
                             true
                         } else {
-                            control.queue_announce(message.packet, now);
+                            control.queue_announce(message.packet.clone(), now);
                             false
                         }
                     });
@@ -958,7 +958,7 @@ impl InterfaceManager {
                     iface.stats.count_announce_tx(size);
                 }
 
-                let _ = iface.tx_send.send(message).await;
+                let _ = iface.tx_send.send(message.clone()).await;
             }
         }
     }

@@ -2,11 +2,11 @@ use core::fmt;
 
 use sha2::Digest;
 
-use crate::buffer::StaticBuffer;
+use crate::buffer::HeapBuffer;
 use crate::hash::AddressHash;
 use crate::hash::Hash;
 
-pub const PACKET_MDU: usize = 2048usize;
+pub const PACKET_MDU: usize = 16384usize;
 pub const PACKET_IFAC_MAX_LENGTH: usize = 64usize;
 
 /// Largest link MTU this implementation can actually build packets for.
@@ -16,6 +16,11 @@ pub const PACKET_IFAC_MAX_LENGTH: usize = 64usize;
 /// `LocalInterface` (HW MTU 256 KiB) negotiates 256 KiB and every packet
 /// between ~2 KiB and 256 KiB is silently dropped.
 pub const LINK_MTU_MAX: usize = PACKET_MDU - PACKET_IFAC_MAX_LENGTH;
+
+/// Largest serialized packet: header, context byte, access code and a full
+/// `PACKET_MDU` payload. Interfaces size their wire buffers from this, not
+/// from `size_of::<Packet>()`, which no longer holds the payload inline.
+pub const PACKET_WIRE_MAX: usize = HEADER_MAXSIZE + 1 + PACKET_IFAC_MAX_LENGTH + PACKET_MDU;
 
 /// The MTU that Reticulum adheres to by default. Changing this breaks
 /// compatibility with all other RNS networks (see Python `RNS.Reticulum.MTU`).
@@ -278,7 +283,7 @@ impl fmt::Display for Header {
     }
 }
 
-pub type PacketDataBuffer = StaticBuffer<PACKET_MDU>;
+pub type PacketDataBuffer = HeapBuffer<PACKET_MDU>;
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub struct PacketIfac {
@@ -301,7 +306,7 @@ impl PacketIfac {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Packet {
     pub header: Header,
     pub ifac: Option<PacketIfac>,
@@ -309,6 +314,47 @@ pub struct Packet {
     pub transport: Option<AddressHash>,
     pub context: PacketContext,
     pub data: PacketDataBuffer,
+}
+
+/// A packet kept around for a while (caches, a resource's parts): the same
+/// fields as [`Packet`], but the payload takes only the bytes it has. A
+/// `Packet` always carries a full `PACKET_MDU` buffer, so storing thousands
+/// of small ones as `Packet`s wastes megabytes.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct StoredPacket {
+    header: Header,
+    ifac: Option<PacketIfac>,
+    destination: AddressHash,
+    transport: Option<AddressHash>,
+    context: PacketContext,
+    data: alloc::boxed::Box<[u8]>,
+}
+
+impl StoredPacket {
+    /// The packet again, ready to send.
+    pub fn packet(&self) -> Packet {
+        Packet {
+            header: self.header,
+            ifac: self.ifac,
+            destination: self.destination,
+            transport: self.transport,
+            context: self.context,
+            data: PacketDataBuffer::new_from_slice(&self.data),
+        }
+    }
+}
+
+impl From<&Packet> for StoredPacket {
+    fn from(packet: &Packet) -> Self {
+        Self {
+            header: packet.header,
+            ifac: packet.ifac,
+            destination: packet.destination,
+            transport: packet.transport,
+            context: packet.context,
+            data: packet.data.as_slice().into(),
+        }
+    }
 }
 
 impl Packet {

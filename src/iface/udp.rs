@@ -71,7 +71,7 @@ impl UdpInterface {
             log::info!("udp_interface bound to <{}>", bind_addr);
             stats.set_online(true);
 
-            const BUFFER_SIZE: usize = core::mem::size_of::<Packet>() * 3;
+            const BUFFER_SIZE: usize = crate::packet::PACKET_WIRE_MAX;
 
             // Start receive task
             let rx_task = {

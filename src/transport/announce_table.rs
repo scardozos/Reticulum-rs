@@ -77,7 +77,7 @@ impl AnnounceEntry {
             destination: self.packet.destination,
             transport: Some(*transport_id),
             context,
-            data: self.packet.data,
+            data: self.packet.data.clone(),
         };
 
         let tx_type = match self.response_to_iface {
@@ -155,7 +155,7 @@ impl AnnounceTable {
             Duration::from_secs_f64((OsRng.next_u64() >> 11) as f64 / (1u64 << 53) as f64 * 0.5);
 
         let entry = AnnounceEntry {
-            packet: *announce,
+            packet: announce.clone(),
             timeout: now + rand_window,
             received_from,
             retries: 0,

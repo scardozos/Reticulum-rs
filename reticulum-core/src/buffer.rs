@@ -121,6 +121,113 @@ impl<const N: usize> Default for StaticBuffer<N> {
     }
 }
 
+/// [`StaticBuffer`]'s API over a `Vec`: holds at most `N` bytes but only
+/// takes the memory it uses. Packet payloads use it so that a large
+/// `PACKET_MDU` costs nothing for small packets, and packets stay small to
+/// move and to keep on the stack.
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
+pub struct HeapBuffer<const N: usize> {
+    data: alloc::vec::Vec<u8>,
+}
+
+impl<const N: usize> HeapBuffer<N> {
+    pub const fn new() -> Self {
+        Self {
+            data: alloc::vec::Vec::new(),
+        }
+    }
+
+    pub fn new_from_slice(data: &[u8]) -> Self {
+        let mut buffer = Self::new();
+        buffer.safe_write(data);
+        buffer
+    }
+
+    pub fn reset(&mut self) {
+        self.data.clear();
+    }
+
+    pub fn resize(&mut self, len: usize) {
+        self.data.resize(min(len, N), 0);
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    pub fn chain_write(&mut self, data: &[u8]) -> Result<&mut Self, RnsError> {
+        self.write(data)?;
+        Ok(self)
+    }
+
+    /// A copy of the contents, for the end of a `chain_write` chain (which
+    /// `StaticBuffer` gets by being `Copy`).
+    pub fn finalize(&mut self) -> Self {
+        self.clone()
+    }
+
+    pub fn safe_write(&mut self, data: &[u8]) -> usize {
+        let max_size = min(data.len(), N - self.data.len());
+        self.write(&data[..max_size]).unwrap_or(0)
+    }
+
+    pub fn chain_safe_write(&mut self, data: &[u8]) -> &mut Self {
+        self.safe_write(data);
+        self
+    }
+
+    pub fn write(&mut self, data: &[u8]) -> Result<usize, RnsError> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        if self.data.len() + data.len() > N {
+            return Err(RnsError::OutOfMemory);
+        }
+        self.data.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    pub fn rotate_left(&mut self, mid: usize) -> Result<usize, RnsError> {
+        if mid > self.data.len() {
+            return Err(RnsError::InvalidArgument);
+        }
+        self.data.drain(..mid);
+        Ok(self.data.len())
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+
+    pub fn accuire_buf(&mut self, len: usize) -> &mut [u8] {
+        self.data.resize(min(len, N), 0);
+        &mut self.data
+    }
+
+    pub fn accuire_buf_max(&mut self) -> &mut [u8] {
+        self.data.resize(N, 0);
+        &mut self.data
+    }
+}
+
+impl<const N: usize> fmt::Display for HeapBuffer<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[ 0x")?;
+        for byte in &self.data {
+            write!(f, "{byte:0>2x}")?;
+        }
+        write!(f, " ]",)
+    }
+}
+
 pub struct OutputBuffer<'a> {
     buffer: &'a mut [u8],
     offset: usize,
