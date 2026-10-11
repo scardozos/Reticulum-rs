@@ -111,7 +111,8 @@ impl TcpClient {
             stats.set_online(true);
             log::info!("tcp_client connected to <{}>", addr);
 
-            const BUFFER_SIZE: usize = core::mem::size_of::<Packet>() * 2;
+            // Twice the largest packet: HDLC escaping can double it.
+            const BUFFER_SIZE: usize = crate::packet::PACKET_WIRE_MAX * 2;
 
             // Start receive task
             let rx_task = {
@@ -123,9 +124,9 @@ impl TcpClient {
                 let channel_ifac_rx = channel_ifac.clone();
 
                 tokio::spawn(async move {
-                    let mut hdlc_rx_buffer = [0u8; BUFFER_SIZE];
-                    let mut rx_buffer = [0u8; BUFFER_SIZE + (BUFFER_SIZE / 2)];
-                    let mut tcp_buffer = [0u8; (BUFFER_SIZE * 16)];
+                    let mut hdlc_rx_buffer = vec![0u8; BUFFER_SIZE];
+                    let mut rx_buffer = vec![0u8; BUFFER_SIZE + (BUFFER_SIZE / 2)];
+                    let mut tcp_buffer = vec![0u8; 64 * 1024];
 
                     loop {
                         tokio::select! {
@@ -220,8 +221,8 @@ impl TcpClient {
                             break;
                         }
 
-                        let mut hdlc_tx_buffer = [0u8; BUFFER_SIZE];
-                        let mut tx_buffer = [0u8; BUFFER_SIZE];
+                        let mut hdlc_tx_buffer = vec![0u8; BUFFER_SIZE];
+                        let mut tx_buffer = vec![0u8; BUFFER_SIZE];
 
                         let mut tx_channel = tx_channel.lock().await;
 

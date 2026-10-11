@@ -94,6 +94,6 @@ impl BridgeInterface {
 impl Interface for BridgeInterface {
     fn mtu() -> usize {
         // The actual per-platform MTU is enforced by the worker at runtime.
-        core::mem::size_of::<Packet>()
+        reticulum::packet::PACKET_MDU
     }
 }

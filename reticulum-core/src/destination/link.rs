@@ -141,6 +141,9 @@ pub trait LinkPayloadSink: Clone + Send + Sync + 'static {
     fn send(&self, payload: LinkPayload);
 }
 
+/// `Clone` gives a snapshot: transport can build a large outgoing resource
+/// (encrypt + hash a megabyte) from a copy without holding the link's lock.
+#[derive(Clone)]
 pub struct Link {
     id: LinkId,
     destination: DestinationDesc,
@@ -247,7 +250,9 @@ impl Link {
             if mtu == 0 {
                 crate::packet::PROTOCOL_MTU
             } else {
-                mtu
+                // Confirm no more than we can build; the proof tells the
+                // initiator the MTU we settled on.
+                mtu.min(crate::packet::LINK_MTU_MAX)
             }
         } else {
             crate::packet::PROTOCOL_MTU
@@ -538,12 +543,12 @@ impl Link {
         self.mtu
     }
 
-    /// Set the negotiated link MTU (bounded by the protocol MTU floor rules).
+    /// Set the negotiated link MTU, bounded by `LINK_MTU_MIN` and `LINK_MTU_MAX`.
     pub fn set_mtu(&mut self, mtu: usize) {
         self.mtu = if mtu == 0 {
             crate::packet::PROTOCOL_MTU
         } else {
-            mtu.max(crate::packet::LINK_MTU_MIN)
+            mtu.clamp(crate::packet::LINK_MTU_MIN, crate::packet::LINK_MTU_MAX)
         };
     }
 
@@ -785,7 +790,7 @@ impl Link {
 
         match packet.context {
             PacketContext::None => {
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = alloc::vec![0u8; PACKET_MDU];
                 if let Ok(plain_text) = self.decrypt_with_rng(
                     crate::crypt::fernet::ZeroRng,
                     packet.data.as_slice(),
@@ -810,7 +815,7 @@ impl Link {
                 }
             }
             PacketContext::LinkIdentify => {
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = alloc::vec![0u8; PACKET_MDU];
                 if let Ok(plain_text) = self.decrypt_with_rng(
                     crate::crypt::fernet::ZeroRng,
                     packet.data.as_slice(),
@@ -885,7 +890,7 @@ impl Link {
                 }
             }
             PacketContext::LinkRTT if !out_link => {
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = alloc::vec![0u8; PACKET_MDU];
                 if let Ok(plain_text) = self.decrypt_with_rng(
                     crate::crypt::fernet::ZeroRng,
                     packet.data.as_slice(),
@@ -908,7 +913,7 @@ impl Link {
                 }
             }
             PacketContext::LinkClose => {
-                let mut buffer = [0u8; PACKET_MDU];
+                let mut buffer = alloc::vec![0u8; PACKET_MDU];
                 if let Ok(plain_text) = self.decrypt_with_rng(
                     crate::crypt::fernet::ZeroRng,
                     packet.data.as_slice(),
@@ -934,7 +939,7 @@ impl Link {
             }
             PacketContext::Channel => {
                 if let Some(channel_tx) = channel_tx {
-                    let mut buffer = [0u8; PACKET_MDU];
+                    let mut buffer = alloc::vec![0u8; PACKET_MDU];
                     if let Ok(plain_text) = self.decrypt_with_rng(
                         crate::crypt::fernet::ZeroRng,
                         packet.data.as_slice(),
@@ -973,8 +978,16 @@ impl Link {
         packet: &Packet,
     ) -> LinkHandleResult {
         if self.status == LinkStatus::Pending && packet.context == PacketContext::LinkRequestProof {
-            if let Ok(identity) = validate_proof_packet(&self.destination, &self.id, packet) {
+            if let Ok((identity, confirmed_mtu)) =
+                validate_proof_packet(&self.destination, &self.id, packet)
+            {
                 log::debug!("link({}): has been proved", self.id);
+
+                // Adopt the MTU the destination confirmed, which transport
+                // nodes on the path may have clamped below what we asked for
+                // (Python `Link.validate_proof`:
+                // `self.mtu = confirmed_mtu or RNS.Reticulum.MTU`).
+                self.set_mtu(confirmed_mtu.unwrap_or(0));
 
                 self.handshake(identity);
                 self.remote_identity = Some(self.destination.identity);
@@ -1100,7 +1113,7 @@ fn validate_proof_packet(
     destination: &DestinationDesc,
     id: &LinkId,
     packet: &Packet,
-) -> Result<Identity, RnsError> {
+) -> Result<(Identity, Option<usize>), RnsError> {
     const MIN_PROOF_LEN: usize = SIGNATURE_LENGTH + PUBLIC_KEY_LENGTH;
     const MTU_PROOF_LEN: usize = SIGNATURE_LENGTH + PUBLIC_KEY_LENGTH + LINK_MTU_SIZE;
     const SIGN_DATA_LEN: usize = ADDRESS_HASH_SIZE + PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE;
@@ -1110,6 +1123,7 @@ fn validate_proof_packet(
     }
 
     let mut proof_data = [0u8; SIGN_DATA_LEN];
+    let mut confirmed_mtu = None;
 
     let verifying_key = destination.identity.verifying_key.as_bytes();
     let sign_data_len = {
@@ -1124,6 +1138,11 @@ fn validate_proof_packet(
         if packet.data.len() >= MTU_PROOF_LEN {
             let mtu_bytes = &packet.data.as_slice()[SIGNATURE_LENGTH + PUBLIC_KEY_LENGTH..];
             output.write(mtu_bytes)?;
+            // Python `Link.mtu_from_lp_packet`.
+            let value = ((mtu_bytes[0] as usize) << 16)
+                | ((mtu_bytes[1] as usize) << 8)
+                | (mtu_bytes[2] as usize);
+            confirmed_mtu = Some(value & 0x1F_FFFF);
         }
 
         output.offset()
@@ -1141,7 +1160,7 @@ fn validate_proof_packet(
         .verify(&proof_data[..sign_data_len], &signature)
         .map_err(|_| RnsError::IncorrectSignature)?;
 
-    Ok(identity)
+    Ok((identity, confirmed_mtu))
 }
 
 fn validate_message_proof(identity: &Identity, data: &[u8]) -> Result<Hash, RnsError> {
@@ -1172,7 +1191,7 @@ fn validate_message_proof(identity: &Identity, data: &[u8]) -> Result<Hash, RnsE
 mod mtu_tests {
     use super::*;
     use crate::destination::{DestinationName, SingleInputDestination};
-    use crate::packet::{LINK_MTU_MIN, PROTOCOL_MTU};
+    use crate::packet::{LINK_MTU_MAX, LINK_MTU_MIN, PROTOCOL_MTU};
 
     fn request_with_mtu(mtu: usize) -> (Packet, PrivateIdentity, DestinationDesc) {
         let peer = PrivateIdentity::new_from_rand(OsRng);
@@ -1219,6 +1238,71 @@ mod mtu_tests {
         );
     }
 
+    #[derive(Clone)]
+    struct NoEvents;
+    impl LinkEventSink for NoEvents {
+        fn send(&self, _event: LinkEventData) {}
+    }
+    impl LinkPayloadSink for NoEvents {
+        fn send(&self, _payload: LinkPayload) {}
+    }
+
+    /// Run a handshake whose link request is rewritten to signal `path_mtu`
+    /// on the way, like a Python transport node clamping it for a slow hop.
+    /// Returns (initiator MTU, responder MTU).
+    fn handshake_through_path(requested: usize, path_mtu: usize) -> (usize, usize) {
+        let local = PrivateIdentity::new_from_rand(OsRng);
+        let destination =
+            SingleInputDestination::new(local.clone(), DestinationName::new("test", "link.path"));
+        let mut initiator = Link::new(destination.desc);
+        initiator.set_mtu(requested);
+        let mut request = initiator.request();
+        let len = request.data.len();
+        let mut data = PacketDataBuffer::new();
+        data.safe_write(&request.data.as_slice()[..len - LINK_MTU_SIZE]);
+        data.safe_write(&Link::signalling_bytes(path_mtu));
+        request.data = data;
+
+        let mut responder =
+            Link::new_from_request(&request, local.sign_key().clone(), destination.desc)
+                .expect("valid request");
+        let proof = LinkExt::<NoEvents>::prove(&mut responder, &NoEvents);
+        let result = LinkExtHandlePacket::<NoEvents, NoEvents>::handle_packet(
+            &mut initiator,
+            &NoEvents,
+            None,
+            &proof,
+            true,
+        );
+        assert!(matches!(result, LinkHandleResult::Activated));
+        (initiator.mtu(), responder.mtu())
+    }
+
+    #[test]
+    fn initiator_adopts_mtu_clamped_on_the_path() {
+        assert_eq!(
+            handshake_through_path(LINK_MTU_MAX, PROTOCOL_MTU),
+            (PROTOCOL_MTU, PROTOCOL_MTU)
+        );
+        assert_eq!(handshake_through_path(LINK_MTU_MAX, 1200), (1200, 1200));
+        assert_eq!(
+            handshake_through_path(LINK_MTU_MAX, LINK_MTU_MAX),
+            (LINK_MTU_MAX, LINK_MTU_MAX)
+        );
+    }
+
+    #[test]
+    fn negotiated_mtu_is_capped_at_what_we_can_build() {
+        // A LocalInterface peer asks for its 256 KiB hardware MTU.
+        let (packet, local, desc) = request_with_mtu(262_144);
+        assert_eq!(
+            Link::new_from_request(&packet, local.sign_key().clone(), desc)
+                .expect("large MTU request")
+                .mtu(),
+            LINK_MTU_MAX
+        );
+    }
+
     #[test]
     fn local_mtu_and_size_accessors_are_defensive() {
         let identity = PrivateIdentity::new_from_rand(OsRng);
@@ -1230,6 +1314,8 @@ mod mtu_tests {
         assert_eq!(link.mtu(), PROTOCOL_MTU);
         link.set_mtu(LINK_MTU_MIN - 1);
         assert_eq!(link.mtu(), LINK_MTU_MIN);
+        link.set_mtu(262_144);
+        assert_eq!(link.mtu(), LINK_MTU_MAX);
         assert!(link.mdu() < link.mtu());
         assert!(link.sdu() <= link.mtu());
     }

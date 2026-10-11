@@ -4,7 +4,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{hash::Hash, packet::Packet};
+use crate::{
+    hash::Hash,
+    packet::{Packet, StoredPacket},
+};
 
 pub struct PacketTrack {
     pub time: Instant,
@@ -21,7 +24,7 @@ pub struct PacketCache {
     remove_cache: Vec<Hash>,
     /// Force-cached announce packets by packet hash
     /// (Python `Transport.cache(force_cache=True, packet_type="announce")`).
-    announces: HashMap<Hash, Packet>,
+    announces: HashMap<Hash, StoredPacket>,
     announce_order: VecDeque<Hash>,
 }
 
@@ -87,13 +90,13 @@ impl PacketCache {
             }
         }
 
-        self.announces.insert(hash, *packet);
+        self.announces.insert(hash, packet.into());
     }
 
     /// Retrieve a cached announce by packet hash
     /// (Python `Transport.get_cached_packet(hash, packet_type="announce")`).
     pub fn get_cached_announce(&self, hash: &Hash) -> Option<Packet> {
-        self.announces.get(hash).copied()
+        self.announces.get(hash).map(StoredPacket::packet)
     }
 }
 

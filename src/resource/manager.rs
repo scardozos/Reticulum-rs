@@ -91,6 +91,9 @@ pub(crate) struct ResourceManager {
     pub started_callbacks: HashMap<LinkId, ResourceStartedCallback>,
     /// Registered request handlers per destination hash, keyed by path hash.
     pub request_handlers: HashMap<AddressHash, HashMap<AddressHash, RequestHandler>>,
+    /// (destination, path hash) pairs whose responses are never
+    /// auto-compressed (Python `register_request_handler(auto_compress=False)`).
+    pub uncompressed_responses: HashSet<(AddressHash, AddressHash)>,
     /// Pending outbound requests: request id -> link.
     pub pending_requests: HashMap<AddressHash, LinkId>,
     /// Responses that completed before the caller began awaiting them,
@@ -101,6 +104,10 @@ pub(crate) struct ResourceManager {
     /// Accumulated bytes of split resources by original hash
     /// (Python appends per-segment assembled data to storage).
     pub split_assembly: HashMap<crate::hash::Hash, SplitAssembly>,
+    /// Window and in-flight rate of the last incoming resource completed on
+    /// each link, for the link to start the next one from
+    /// (Python `Link.resource_concluded`).
+    concluded: HashMap<LinkId, (usize, Option<f64>)>,
     pub events: broadcast::Sender<ResourceEvent>,
     pub request_events: broadcast::Sender<RequestEventData>,
     pub max_decompressed_size: usize,
@@ -144,10 +151,12 @@ impl ResourceManager {
             accept_callbacks: HashMap::new(),
             started_callbacks: HashMap::new(),
             request_handlers: HashMap::new(),
+            uncompressed_responses: HashSet::new(),
             pending_requests: HashMap::new(),
             async_request_handlers: HashMap::new(),
             completed_responses: HashMap::new(),
             split_assembly: HashMap::new(),
+            concluded: HashMap::new(),
             events,
             request_events,
             max_decompressed_size: DEFAULT_MAX_DECOMPRESSED_SIZE,
@@ -201,6 +210,30 @@ impl ResourceManager {
         if let Some(handlers) = self.request_handlers.get_mut(&destination) {
             handlers.remove(&path_hash);
         }
+        self.uncompressed_responses
+            .remove(&(destination, path_hash));
+    }
+
+    /// Whether responses for `path` on `destination` may be auto-compressed.
+    pub fn set_response_compression(
+        &mut self,
+        destination: AddressHash,
+        path: &str,
+        enabled: bool,
+    ) {
+        let path_hash = crate::hash::Hash::new_from_slice(path.as_bytes());
+        let key = (destination, AddressHash::new_from_hash(&path_hash));
+        if enabled {
+            self.uncompressed_responses.remove(&key);
+        } else {
+            self.uncompressed_responses.insert(key);
+        }
+    }
+
+    pub fn compresses_responses(&self, destination: &AddressHash, path_hash: &AddressHash) -> bool {
+        !self
+            .uncompressed_responses
+            .contains(&(*destination, *path_hash))
     }
 
     /// Create, store and advertise an outgoing resource on `link`.
@@ -211,13 +244,23 @@ impl ResourceManager {
         data: Vec<u8>,
         opts: ResourceOptions,
     ) -> Result<ResourceTx, RnsError> {
+        let resource = OutgoingResource::new(data, link, opts)?;
+        self.queue_resource(link, resource)
+    }
+
+    /// Store `resource` (built from `link` or a snapshot of it) and
+    /// advertise it, or queue it behind the transfer already running on the
+    /// link. Lets callers build a large resource without holding locks.
+    pub fn queue_resource(
+        &mut self,
+        link: &Link,
+        mut resource: OutgoingResource,
+    ) -> Result<ResourceTx, RnsError> {
         let active = self
             .out
             .get(link.id())
             .map(|list| list.iter().any(|r| !r.status.is_concluded()))
             .unwrap_or(false);
-
-        let mut resource = OutgoingResource::new(data, link, opts)?;
         let mut tx = ResourceTx::default();
 
         if active {
@@ -466,6 +509,14 @@ impl ResourceManager {
         (tx, assembled)
     }
 
+    /// The window and rate of the incoming resource that last completed on
+    /// `link`, once: the link keeps them so the next resource on it starts
+    /// where this one ended instead of at `WINDOW` (Python
+    /// `Link.resource_concluded` / `Resource.accept`).
+    pub fn take_concluded(&mut self, link: &LinkId) -> Option<(usize, Option<f64>)> {
+        self.concluded.remove(link)
+    }
+
     /// Assemble a completed incoming resource on this link (first match).
     /// Sends the proof and emits events; returns the assembled data when
     /// this was the final segment.
@@ -482,6 +533,8 @@ impl ResourceManager {
             match resource.assemble(link, self.max_decompressed_size) {
                 Ok(data) => {
                     resource.status = ResourceStatus::Complete;
+                    self.concluded
+                        .insert(*link.id(), (resource.window, resource.eifr));
                     resource.prove(link, &resource.assembled.clone().unwrap(), tx);
                     resource.last_activity = super::unix_time();
 
@@ -731,6 +784,32 @@ impl ResourceManager {
                 next.original_hash
             );
             self.out.entry(*link.id()).or_default().push(next);
+        }
+
+        self.advertise_queued(link, tx);
+    }
+
+    /// Advertise the oldest queued resource on `link` if nothing else is
+    /// transferring on it. Still one transfer per link at a time, as in
+    /// Python, but the next one starts the moment the last is proved,
+    /// instead of at the next watchdog sweep (up to a second later; Python's
+    /// advertise thread polls every 0.25 s). Request pipelining depends on
+    /// this: a queued response otherwise idled the link for most of a second.
+    fn advertise_queued(&mut self, link: &Link, tx: &mut ResourceTx) {
+        let Some(resources) = self.out.get_mut(link.id()) else {
+            return;
+        };
+        let busy = resources
+            .iter()
+            .any(|r| !r.status.is_concluded() && r.status != ResourceStatus::Queued);
+        if busy {
+            return;
+        }
+        if let Some(next) = resources
+            .iter_mut()
+            .find(|r| r.status == ResourceStatus::Queued)
+        {
+            let _ = next.advertise(link, tx);
         }
     }
 
@@ -1129,6 +1208,31 @@ mod tests {
             SingleInputDestination::new(identity, DestinationName::new("test", "resource.request"))
                 .desc,
         )
+    }
+
+    #[test]
+    fn response_compression_is_per_destination_and_path() {
+        let mut manager = ResourceManager::new();
+        let dest = AddressHash::new_from_hash(&crate::hash::Hash::new_from_slice(b"dest"));
+        let other = AddressHash::new_from_hash(&crate::hash::Hash::new_from_slice(b"other"));
+        let path =
+            |p: &str| AddressHash::new_from_hash(&crate::hash::Hash::new_from_slice(p.as_bytes()));
+
+        // On by default, like Python's `auto_compress=True`.
+        assert!(manager.compresses_responses(&dest, &path("/data")));
+
+        manager.set_response_compression(dest, "/data", false);
+        assert!(!manager.compresses_responses(&dest, &path("/data")));
+        assert!(manager.compresses_responses(&dest, &path("/meta")));
+        assert!(manager.compresses_responses(&other, &path("/data")));
+
+        manager.set_response_compression(dest, "/data", true);
+        assert!(manager.compresses_responses(&dest, &path("/data")));
+
+        // Deregistering a handler forgets its setting.
+        manager.set_response_compression(dest, "/data", false);
+        manager.deregister_request_handler(dest, "/data");
+        assert!(manager.compresses_responses(&dest, &path("/data")));
     }
 
     #[test]

@@ -940,9 +940,9 @@ impl Transport {
             {
                 let packet = link.data_packet(payload);
                 if let Ok(packet) = packet {
+                    sent_packets.push(packet.hash());
                     handler.send_packet(packet).await;
                     link.touch();
-                    sent_packets.push(packet.hash());
                 }
             }
         }
@@ -1331,6 +1331,25 @@ impl Transport {
             .register_request_handler(*destination, path, Arc::new(handler));
     }
 
+    /// Turn automatic bz2 compression of responses for `path` on or off
+    /// (Python `Destination.register_request_handler(..., auto_compress)`).
+    /// On by default. Turn it off for paths that return incompressible data
+    /// (media, archives, encrypted blobs): compressing it costs CPU and the
+    /// result is discarded anyway. Receivers handle both cases, since every
+    /// resource advertisement says whether its data is compressed.
+    pub async fn set_response_compression(
+        &self,
+        destination: &AddressHash,
+        path: &str,
+        enabled: bool,
+    ) {
+        self.handler
+            .lock()
+            .await
+            .resources
+            .set_response_compression(*destination, path, enabled);
+    }
+
     /// Register an async request handler for a path on one of our inbound
     /// destinations. Async handlers keep the transport responsive for
     /// long-running work (e.g. remote command execution).
@@ -1479,11 +1498,12 @@ impl Transport {
 
         let rid = if packed.len() <= link_guard.mdu() {
             let packet = link_guard.context_packet(&packed, PacketContext::Request)?;
-            handler.send_packet(packet).await;
             // A packet-carried request is tracked by its packet hashable
             // part (Python `PacketReceipt.truncated_hash`), which is the
             // id a responder echoes back.
-            request_id_from_packet(&packet)
+            let rid = request_id_from_packet(&packet);
+            handler.send_packet(packet).await;
+            rid
         } else {
             // A resource-carried request keeps the packed-payload id
             // (Python `Link.request` sets `request_id =
@@ -1657,7 +1677,7 @@ impl Transport {
 
         let mut packet_data = PacketDataBuffer::new();
 
-        let mut buffer = [0u8; PACKET_MDU];
+        let mut buffer = vec![0u8; PACKET_MDU];
         match destination.encrypt_group(data, &mut buffer[..]) {
             Ok(token) => {
                 let _ = packet_data.safe_write(token);
@@ -1766,7 +1786,7 @@ impl Transport {
             .map(crate::identity::PublicKey::from)
         };
 
-        let mut token = [0u8; PACKET_MDU];
+        let mut token = vec![0u8; PACKET_MDU];
         let token_len = identity
             .encrypt(OsRng, data, ratchet.as_ref(), &mut token[..])?
             .len();
@@ -2175,11 +2195,23 @@ impl TransportHandler {
         self.in_links.get(link_id).cloned()
     }
 
+    /// `out_links` is keyed by destination hash, not link id, so an outbound
+    /// link can only be found by id by looking at each link. `try_lock`, as
+    /// in `Transport::interface_stats_for_link`: the handler lock is held
+    /// here, and awaiting a link lock could deadlock against a task that
+    /// holds that link and waits for the handler.
+    fn find_out_link_by_id(&self, link_id: &LinkId) -> Option<Arc<Mutex<Link>>> {
+        self.out_links
+            .values()
+            .find(|link| link.try_lock().is_ok_and(|link| link.id() == link_id))
+            .cloned()
+    }
+
     pub(crate) async fn link_close(&self, link_id: LinkId) -> Result<(), RnsError> {
         let link = if let Some(link) = self.find_in_link(&link_id) {
             Some((link, &self.link_in_event_tx))
         } else {
-            self.find_out_link(&link_id)
+            self.find_out_link_by_id(&link_id)
                 .map(|link| (link, &self.link_out_event_tx))
         };
         if let Some((link, event_tx)) = link {
@@ -2629,10 +2661,10 @@ async fn handle_resource_packet<'a>(
 ) -> bool {
     use crate::packet::PacketContext as Ctx;
 
-    let link = link_arc.lock().await;
+    let mut link = link_arc.lock().await;
     let handled = match packet.context {
         Ctx::ResourceAdvertisement => {
-            let mut buffer = [0u8; PACKET_MDU];
+            let mut buffer = vec![0u8; PACKET_MDU];
             match link.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                 Ok(plaintext) => {
                     let tx = handler
@@ -2648,7 +2680,7 @@ async fn handle_resource_packet<'a>(
             }
         }
         Ctx::ResourceRequest => {
-            let mut buffer = [0u8; PACKET_MDU];
+            let mut buffer = vec![0u8; PACKET_MDU];
             match link.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                 Ok(plaintext) => {
                     let tx = handler.resources.handle_request_data(&link, plaintext);
@@ -2661,7 +2693,7 @@ async fn handle_resource_packet<'a>(
             }
         }
         Ctx::ResourceHashUpdate => {
-            let mut buffer = [0u8; PACKET_MDU];
+            let mut buffer = vec![0u8; PACKET_MDU];
             match link.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                 Ok(plaintext) => {
                     let tx = handler.resources.handle_hashmap_update(&link, plaintext);
@@ -2680,7 +2712,12 @@ async fn handle_resource_packet<'a>(
             }
             if completed {
                 let mut tx = crate::resource::ResourceTx::default();
-                if let Some((_hash, data)) = handler.resources.assemble_completed(&link, &mut tx) {
+                let assembled = handler.resources.assemble_completed(&link, &mut tx);
+                if let Some((window, eifr)) = handler.resources.take_concluded(link.id()) {
+                    link.set_last_resource_window(Some(window));
+                    link.set_last_resource_eifr(eifr);
+                }
+                if let Some((_hash, data)) = assembled {
                     for p in tx.packets {
                         handler.send_packet(p).await;
                     }
@@ -2723,14 +2760,14 @@ async fn handle_resource_packet<'a>(
             true
         }
         Ctx::ResourceInitiatorCancel => {
-            let mut buffer = [0u8; PACKET_MDU];
+            let mut buffer = vec![0u8; PACKET_MDU];
             if let Ok(plaintext) = link.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                 handler.resources.handle_cancel(&link, plaintext);
             }
             true
         }
         Ctx::ResourceReceiverCancel => {
-            let mut buffer = [0u8; PACKET_MDU];
+            let mut buffer = vec![0u8; PACKET_MDU];
             if let Ok(plaintext) = link.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                 handler.resources.handle_reject(&link, plaintext);
             }
@@ -2747,6 +2784,7 @@ async fn send_response<'a>(
     link: &Link,
     rid: &AddressHash,
     response: &[u8],
+    auto_compress: bool,
     handler: &mut MutexGuard<'a, TransportHandler>,
 ) {
     let packed = pack_response(rid, response);
@@ -2758,6 +2796,7 @@ async fn send_response<'a>(
         let opts = ResourceOptions {
             request_id: Some(*rid),
             is_response: true,
+            auto_compress,
             ..Default::default()
         };
         match handler.resources.send_resource(link, packed, opts) {
@@ -2768,6 +2807,51 @@ async fn send_response<'a>(
             }
             Err(err) => log::debug!("tp: could not send response resource: {err:?}"),
         }
+    }
+}
+
+/// `send_response` for a response made outside the transport lock (by an
+/// async handler). One big enough for a resource is built from a snapshot
+/// of the link before any lock is taken: encrypting and hashing up to a
+/// megabyte under the transport lock stalled every other packet, including
+/// the parts of the transfer already running on the link.
+async fn send_response_unlocked(
+    link_arc: &Arc<Mutex<Link>>,
+    transport_handler: &Arc<Mutex<TransportHandler>>,
+    rid: &AddressHash,
+    response: &[u8],
+    auto_compress: bool,
+) {
+    let snapshot = link_arc.lock().await.clone();
+    let packed = pack_response(rid, response);
+    if packed.len() <= snapshot.mdu() {
+        let mut handler = transport_handler.lock().await;
+        let link = link_arc.lock().await;
+        send_response(&link, rid, response, auto_compress, &mut handler).await;
+        return;
+    }
+    let opts = ResourceOptions {
+        request_id: Some(*rid),
+        is_response: true,
+        auto_compress,
+        ..Default::default()
+    };
+    let resource = match resource::OutgoingResource::new(packed, &snapshot, opts) {
+        Ok(resource) => resource,
+        Err(err) => {
+            log::debug!("tp: could not build response resource: {err:?}");
+            return;
+        }
+    };
+    let mut handler = transport_handler.lock().await;
+    let link = link_arc.lock().await;
+    match handler.resources.queue_resource(&link, resource) {
+        Ok(tx) => {
+            for p in tx.packets {
+                handler.send_packet(p).await;
+            }
+        }
+        Err(err) => log::debug!("tp: could not send response resource: {err:?}"),
     }
 }
 
@@ -2783,6 +2867,9 @@ async fn handle_incoming_request<'a>(
     let link = link_arc.lock().await;
     let destination = link.destination().address_hash;
     let remote_identity = link.remote_identity();
+    let auto_compress = handler
+        .resources
+        .compresses_responses(&destination, &path_hash);
 
     // Async handlers run WITHOUT the transport/link locks held: snapshot
     // the inputs, drop the link guard, run the future on the runtime, and
@@ -2817,9 +2904,14 @@ async fn handle_incoming_request<'a>(
             .await;
 
             if let Some(response) = response {
-                let mut handler = transport_handler.lock().await;
-                let link = link_arc.lock().await;
-                send_response(&link, &rid, &response, &mut handler).await;
+                send_response_unlocked(
+                    &link_arc,
+                    &transport_handler,
+                    &rid,
+                    &response,
+                    auto_compress,
+                )
+                .await;
             }
         });
         return;
@@ -2846,7 +2938,7 @@ async fn handle_incoming_request<'a>(
     });
 
     if let Some(response) = response {
-        send_response(&link, &rid, &response, handler).await;
+        send_response(&link, &rid, &response, auto_compress, handler).await;
     }
 }
 
@@ -2878,7 +2970,7 @@ async fn handle_request_or_response_packet<'a>(
     handler: &mut MutexGuard<'a, TransportHandler>,
 ) -> bool {
     let link_guard = link.lock().await;
-    let mut buffer = [0u8; PACKET_MDU];
+    let mut buffer = vec![0u8; PACKET_MDU];
     let Ok(plaintext) = link_guard.decrypt(packet.data.as_slice(), &mut buffer[..]) else {
         return false;
     };
@@ -3156,7 +3248,7 @@ async fn handle_data<'a>(
         // key when one is loaded (Python `Destination.prv`).
         if let Some(destination) = handler.group_in_destinations.get(&packet.destination) {
             let destination = destination.lock().await;
-            let mut buffer = [0u8; PACKET_MDU];
+            let mut buffer = vec![0u8; PACKET_MDU];
 
             let data = if destination.group_encrypted() {
                 match destination.decrypt_group(packet.data.as_slice(), &mut buffer[..]) {
@@ -3171,7 +3263,7 @@ async fn handle_data<'a>(
                     }
                 }
             } else {
-                packet.data
+                packet.data.clone()
             };
 
             data_handled = true;
@@ -3197,7 +3289,7 @@ async fn handle_data<'a>(
                 .received_data_tx
                 .send(ReceivedData {
                     destination: packet.destination,
-                    data: packet.data,
+                    data: packet.data.clone(),
                     decrypted: false,
                 })
                 .ok();
@@ -3218,7 +3310,7 @@ async fn handle_data<'a>(
             // encrypted to the destination identity (optionally via its
             // announced ratchet), so decrypt before delivering.
             let destination = destination.lock().await;
-            let mut buffer = [0u8; PACKET_MDU];
+            let mut buffer = vec![0u8; PACKET_MDU];
             match destination.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                 Ok(plain_text) => {
                     let data = PacketDataBuffer::new_from_slice(plain_text);
@@ -4434,7 +4526,9 @@ async fn manage_transport(
                             queues.enqueue_and_drain(message)
                         };
                         for message in drained {
-                        let _ = iface_messages_tx.send(message);
+                        if iface_messages_tx.receiver_count() > 0 {
+                            let _ = iface_messages_tx.send(message.clone());
+                        }
 
                         let packet = message.packet;
 
@@ -5191,7 +5285,7 @@ mod tests {
             destination,
             ..Default::default()
         };
-        let duplicate: Packet = data_packet;
+        let duplicate: Packet = data_packet.clone();
 
         let different_packet = Packet {
             data: PacketDataBuffer::new_from_slice(b"bar"),

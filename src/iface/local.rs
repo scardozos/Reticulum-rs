@@ -61,7 +61,7 @@ pub enum SharedInstanceAddress {
     Tcp { port: u16 },
     /// Abstract unix domain socket (`shared_instance_type = domain`),
     /// bound to `\0rns/<instance_name>` (`LocalInterface.py` address format).
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     UnixAbstract { instance_name: String },
 }
 
@@ -72,7 +72,7 @@ impl SharedInstanceAddress {
 
     /// Abstract socket address `\0rns/<instance_name>` (the leading NUL byte
     /// marks the Linux abstract namespace).
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     pub fn unix_abstract(instance_name: impl Into<String>) -> Self {
         Self::UnixAbstract {
             instance_name: instance_name.into(),
@@ -82,7 +82,7 @@ impl SharedInstanceAddress {
     fn describe(&self) -> String {
         match self {
             Self::Tcp { port } => format!("127.0.0.1:{port}"),
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             Self::UnixAbstract { instance_name } => format!("\0rns/{instance_name}"),
         }
     }
@@ -125,7 +125,7 @@ async fn stream_write_all(stream: &mut LocalStreamWrite, data: &[u8]) -> io::Res
 
 enum Listener {
     Tcp(TcpListener),
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     Unix(tokio::net::UnixListener),
 }
 
@@ -279,7 +279,7 @@ impl LocalServer {
                 let _ = stream.set_nodelay(true);
                 (format!("{peer}"), StreamType::Tcp(stream))
             }
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             Listener::Unix(listener) => {
                 let (stream, _) = listener.accept().await.ok()?;
                 ("local".to_string(), StreamType::Unix(stream))
@@ -553,7 +553,7 @@ impl LocalClient {
                 let _ = stream.set_nodelay(true);
                 Some(StreamType::Tcp(stream))
             }
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             SharedInstanceAddress::UnixAbstract { instance_name } => {
                 use std::os::linux::net::SocketAddrExt;
                 use std::os::unix::net::SocketAddr as UnixSocketAddr;
@@ -794,7 +794,9 @@ impl LocalClient {
                         }
 
                         let packet = message.packet;
-                        let mut buffer = [0u8; 8192 + 16];
+                        // Room for the largest packet we can build: a fixed
+                        // 8 KiB here silently dropped bigger link packets.
+                        let mut buffer = vec![0u8; crate::packet::PACKET_MDU + 128];
                         let mut output = OutputBuffer::new(&mut buffer[..]);
                         if packet.serialize(&mut output).is_ok() {
                             let ifac = channel_ifac.read().expect("ifac lock").clone();

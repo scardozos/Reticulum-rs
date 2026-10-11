@@ -8,7 +8,7 @@ use sha2::Digest;
 use crate::destination::link::{Link, LinkId};
 use crate::error::RnsError;
 use crate::hash::{AddressHash, Hash};
-use crate::packet::{Packet, PacketContext, PacketType};
+use crate::packet::{PacketContext, PacketType, StoredPacket};
 
 use super::advertisement::{ResourceAdvertisement, COLLISION_GUARD_SIZE, HASHMAP_MAX_LEN};
 use super::{
@@ -45,7 +45,9 @@ pub struct OutgoingResource {
     pub sdu: usize,
 
     /// Pre-built part packets with per-part map hashes.
-    pub parts: Vec<Packet>,
+    /// Kept compact: a `Packet` is `PACKET_MDU` bytes, and a resource over
+    /// a 500-byte-MTU link has thousands of parts.
+    pub parts: Vec<StoredPacket>,
     pub part_hashes: Vec<[u8; MAPHASH_LEN]>,
     pub part_sent: Vec<bool>,
     pub hashmap: Vec<u8>,
@@ -198,7 +200,7 @@ impl OutgoingResource {
                 }
 
                 let packet = link.raw_packet(chunk, PacketType::Data, PacketContext::Resource)?;
-                parts.push(packet);
+                parts.push(StoredPacket::from(&packet));
                 part_hashes.push(mh);
                 hashmap.extend_from_slice(&mh);
             }
@@ -421,7 +423,7 @@ impl OutgoingResource {
 
         for i in search_start..search_end {
             if map_hashes.contains(&self.part_hashes[i]) {
-                let packet = self.parts[i];
+                let packet = self.parts[i].packet();
                 if !self.part_sent[i] {
                     self.part_sent[i] = true;
                     self.sent_parts += 1;
